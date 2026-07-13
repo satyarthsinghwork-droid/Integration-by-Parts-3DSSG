@@ -1,0 +1,29 @@
+# Datasets and Embeddings
+pipeline_data/
+3RScan/
+3DSSG/
+
+# Model Outputs and Checkpoints
+pipeline_outputs/
+pipeline_outputs_smoke/
+
+# Environment and Jupyter
+anaconda_projects/
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary/Compiled files
+*.pdf
+*.zip
+base_paper_text.txt
+draft_paper_text.txt
+
+# OS Generated
+.DS_Store
+Thumbs.db
