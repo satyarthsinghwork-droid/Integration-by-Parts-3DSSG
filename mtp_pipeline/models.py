@@ -10,13 +10,14 @@ import torch.nn.functional as F
 class InputProjection(nn.Module):
     """Project pretrained RGB and text features into the common d-dimensional space."""
 
-    def __init__(self, dim: int = 384, rgb_dim: int = 768, text_dim: int = 512):
+    def __init__(self, dim: int = 384, rgb_dim: int = 768, lidar_dim: int = 512, text_dim: int = 512):
         super().__init__()
         self.rgb_proj = nn.Linear(rgb_dim, dim)
+        self.lidar_proj = nn.Linear(lidar_dim, dim)
         self.text_proj = nn.Linear(text_dim, dim)
 
     def forward(self, rgb_tokens: torch.Tensor, lidar_tokens: torch.Tensor, text_features: torch.Tensor):
-        return self.rgb_proj(rgb_tokens), lidar_tokens, self.text_proj(text_features)
+        return self.rgb_proj(rgb_tokens), self.lidar_proj(lidar_tokens), self.text_proj(text_features)
 
 
 class ComponentQueries(nn.Module):
@@ -110,8 +111,17 @@ class FusionTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, rgb_object: torch.Tensor, lidar_object: torch.Tensor, text_object: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        rgb_object: torch.Tensor,
+        lidar_object: torch.Tensor,
+        text_object: torch.Tensor,
+        has_rgb_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size = rgb_object.size(0)
+        if has_rgb_mask is not None:
+            has_rgb_mask = has_rgb_mask.to(device=rgb_object.device, dtype=torch.bool).unsqueeze(-1)
+            rgb_object = torch.where(has_rgb_mask, rgb_object, torch.zeros_like(rgb_object))
         fusion = self.fusion_token.expand(batch_size, -1, -1)
         sequence = torch.stack([rgb_object, lidar_object, text_object], dim=1)
         sequence = torch.cat([fusion, sequence], dim=1)
@@ -121,15 +131,39 @@ class FusionTransformer(nn.Module):
 class SceneRepresentationModel(nn.Module):
     """Equations 1-12: component learning, alignment outputs, and object fusion."""
 
-    def __init__(self, dim: int = 384, num_parts: int = 8, num_heads: int = 8, num_layers: int = 2, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int = 384,
+        num_parts: int = 8,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        graph_use_text: bool = False,
+    ):
         super().__init__()
         self.component_encoder = MultimodalComponentEncoder(dim=dim, num_parts=num_parts)
         self.fusion = FusionTransformer(dim=dim, num_heads=num_heads, num_layers=num_layers, dropout=dropout)
+        self.graph_use_text = graph_use_text
 
-    def forward(self, rgb_tokens: torch.Tensor, lidar_tokens: torch.Tensor, text_features: torch.Tensor):
+    def forward(
+        self,
+        rgb_tokens: torch.Tensor,
+        lidar_tokens: torch.Tensor,
+        text_features: torch.Tensor,
+        has_rgb_mask: torch.Tensor | None = None,
+    ):
         outputs = self.component_encoder(rgb_tokens, lidar_tokens, text_features)
+        if has_rgb_mask is not None:
+            outputs["has_rgb_mask"] = has_rgb_mask.to(device=outputs["rgb_object"].device, dtype=torch.bool)
+        # The 3DSSG text vector is generated from the annotated class name.
+        # It supervises cross-modal representation learning but must not reveal
+        # the SGCls target to the graph classifier.
+        graph_text = outputs["text_object"] if self.graph_use_text else torch.zeros_like(outputs["text_object"])
         outputs["fused_object"] = self.fusion(
-            outputs["rgb_object"], outputs["lidar_object"], outputs["text_object"]
+            outputs["rgb_object"],
+            outputs["lidar_object"],
+            graph_text,
+            has_rgb_mask=outputs.get("has_rgb_mask"),
         )
         return outputs
 
@@ -248,7 +282,8 @@ class DynamicSceneGraphModel(nn.Module):
     """Final integrated model: representation, temporal association, and graph heads."""
 
     def __init__(self, num_node_classes: int, num_edge_classes: int, dim: int = 384, num_parts: int = 8,
-                 num_heads: int = 8, fusion_layers: int = 2, temporal_layers: int = 2, dropout: float = 0.1):
+                 num_heads: int = 8, fusion_layers: int = 2, temporal_layers: int = 2, dropout: float = 0.1,
+                 graph_use_text: bool = False):
         super().__init__()
         self.object_encoder = SceneRepresentationModel(
             dim=dim,
@@ -256,6 +291,7 @@ class DynamicSceneGraphModel(nn.Module):
             num_heads=num_heads,
             num_layers=fusion_layers,
             dropout=dropout,
+            graph_use_text=graph_use_text,
         )
         self.association = SoftObjectAssociation(dim=dim)
         self.aggregation = TemporalAggregation()
@@ -287,6 +323,26 @@ class DynamicSceneGraphModel(nn.Module):
     def predict_nodes(self, node_features: torch.Tensor) -> torch.Tensor:
         context_features = self._apply_context(node_features)
         return self.node_head(context_features)
+
+    def predict_graph(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        geom_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict nodes and edges from one shared contextualized object set."""
+        context_features = self._apply_context(node_features)
+        node_logits = self.node_head(context_features)
+        if edge_index.numel() == 0:
+            edge_logits = context_features.new_zeros((0, self.edge_head.num_relations))
+            geom_reconstruction = context_features.new_zeros((0, self.edge_head.geom_dim))
+        else:
+            edge_logits, geom_reconstruction = self.edge_head(
+                context_features[edge_index[:, 0]],
+                context_features[edge_index[:, 1]],
+                geom_features,
+            )
+        return node_logits, edge_logits, geom_reconstruction
 
     def predict_edges(
         self,

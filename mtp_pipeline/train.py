@@ -6,14 +6,15 @@ import random
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .config import PipelineConfig, ProjectPaths, ensure_output_dirs
-from .data import TemporalSceneDataset, build_label_maps, compute_predicate_weights
-from .graph import RELATION_LABELS, build_3dssg_edges, edge_geometric_features, node_labels_for_objects
+from .data import TemporalSceneDataset, build_label_maps, compute_predicate_weights, load_label_space
+from .graph import build_official_3dssg_edges, edge_geometric_features, node_labels_for_objects
 from .losses import (
     DynamicEdgeConsistencyLoss,
     GraphPredictionLoss,
@@ -22,17 +23,8 @@ from .losses import (
     TemporalPartAlignmentLoss,
 )
 from .models import DynamicSceneGraphModel
-from .temporal import process_scene
-
-def get_3rscan_splits(scene_tokens: list[str], seed: int = 42) -> tuple[list[str], list[str]]:
-    """Deterministically split scenes into 80% train, 20% validation."""
-    tokens = sorted(scene_tokens)
-    if len(tokens) < 2:
-        return tokens, []
-    rng = random.Random(seed)
-    rng.shuffle(tokens)
-    split_idx = max(1, int(len(tokens) * 0.8))
-    return tokens[:split_idx], tokens[split_idx:]
+from .splits import get_3rscan_splits
+from .temporal import process_scene, process_static_scene
 
 def graph_losses_for_3dssg_scene(
     scene: dict[str, Any],
@@ -42,6 +34,8 @@ def graph_losses_for_3dssg_scene(
     graph_loss_fn: GraphPredictionLoss,
     dynamic_loss_fn: DynamicEdgeConsistencyLoss,
     device: torch.device,
+    relation_labels: list[str],
+    max_negative_ratio: int | None = None,
 ) -> dict[str, torch.Tensor]:
     
     zero = results["temporal_loss"].new_zeros(())
@@ -77,14 +71,22 @@ def graph_losses_for_3dssg_scene(
                 break
         unique_objects.append(selected)
 
-    edge_index, edge_labels, _ = build_3dssg_edges(unique_objects, scene.get("relationships", []))
+    edge_index, edge_labels, _ = build_official_3dssg_edges(
+        unique_objects,
+        scene.get("relationships", []),
+        relation_labels=relation_labels,
+        max_negative_ratio=max_negative_ratio,
+    )
     edge_index = edge_index.to(device)
     edge_labels = edge_labels.to(device)
     node_labels = node_labels_for_objects(unique_objects, label_to_id, device)
     edge_geom = edge_geometric_features(unique_objects, edge_index, device)
 
-    node_logits = model.predict_nodes(pooled_node_features)
-    edge_logits, geom_reconstruction = model.predict_edges(pooled_node_features, edge_index, edge_geom, return_aux=True)
+    node_logits, edge_logits, geom_reconstruction = model.predict_graph(
+        pooled_node_features,
+        edge_index,
+        edge_geom,
+    )
     
     losses = graph_loss_fn(
         node_logits,
@@ -119,7 +121,7 @@ def graph_losses_for_3dssg_scene(
         frame_edge_logits = model.predict_edges(frame_nodes, frame_edge_idx, frame_geom)
         
         if frame_edge_logits.numel():
-            frame_probs = F.softmax(frame_edge_logits, dim=-1)
+            frame_probs = torch.sigmoid(frame_edge_logits)
             frame_dict = {key: frame_probs[idx] for idx, key in enumerate(frame_edge_keys)}
             edge_probs_by_frame.append(frame_dict)
             
@@ -133,7 +135,15 @@ def graph_losses_for_3dssg_scene(
     }
 
 
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 def train(args: argparse.Namespace) -> Path:
+    _set_seed(getattr(args, "seed", 42))
     paths = ProjectPaths(reference_root=args.reference_root, output_root=args.output_root)
     ensure_output_dirs(paths)
 
@@ -141,6 +151,9 @@ def train(args: argparse.Namespace) -> Path:
     lambda_object = 1.0
     lambda_temporal = args.lambda_temporal
     lambda_temporal_part = args.lambda_temporal_part
+    if args.mode == "static":
+        lambda_temporal = 0.0
+        lambda_temporal_part = 0.0
 
     if args.ablation == "holistic":
         num_parts = 1
@@ -163,16 +176,35 @@ def train(args: argparse.Namespace) -> Path:
 
     database_dir = args.database if args.database is not None else (paths.output_root / "3rscan_database")
     label_to_id, id_to_label = build_label_maps(database_dir)
+    label_space = load_label_space(database_dir)
+    if label_space is None:
+        raise ValueError(
+            "This database has no official label-space manifest. Rebuild it with "
+            "build_3rscan_static_database.py before starting a comparable run."
+        )
+    object_labels, relation_labels, label_protocol = label_space
+    if len(object_labels) != 160 or len(relation_labels) != 26:
+        raise ValueError(
+            f"Expected the official 160/26 OCRL label space, found "
+            f"{len(object_labels)} objects and {len(relation_labels)} relations."
+        )
+    print(f"Label protocol: {label_protocol}")
 
     dataset = TemporalSceneDataset(database_dir, max_frames=args.max_frames)
     
-    # 80/20 Train/Val Split
-    train_tokens, val_tokens = get_3rscan_splits(dataset.scene_tokens)
+    train_tokens, val_tokens = get_3rscan_splits(
+        dataset.scene_tokens,
+        train_scans=getattr(args, "train_scans", None),
+        val_scans=getattr(args, "val_scans", None),
+        seed=getattr(args, "split_seed", 42),
+    )
     dataset.scene_tokens = train_tokens
     
     if args.max_scenes is not None:
         dataset.scene_tokens = dataset.scene_tokens[: args.max_scenes]
     
+    split_name = "official 3DSSG" if getattr(args, "train_scans", None) and getattr(args, "val_scans", None) else "deterministic 80/20"
+    print(f"Using {split_name} split.")
     print(f"Training on {len(dataset.scene_tokens)} scenes (Validation reserved: {len(val_tokens)})")
     
     loader = DataLoader(dataset, batch_size=1, shuffle=args.shuffle, collate_fn=lambda batch: batch[0])
@@ -180,13 +212,14 @@ def train(args: argparse.Namespace) -> Path:
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model = DynamicSceneGraphModel(
         num_node_classes=len(label_to_id),
-        num_edge_classes=len(RELATION_LABELS),
+        num_edge_classes=len(relation_labels),
         dim=config.dim,
         num_parts=config.num_parts,
         num_heads=config.num_heads,
         fusion_layers=config.fusion_layers,
         temporal_layers=config.temporal_layers,
         dropout=config.dropout,
+        graph_use_text=config.graph_use_text,
     ).to(device)
 
     representation_loss = RepresentationLoss(
@@ -198,25 +231,36 @@ def train(args: argparse.Namespace) -> Path:
     temporal_part_loss = TemporalPartAlignmentLoss(temperature=config.temperature).to(device)
     
     print("Computing Alpha class weights to balance rare 3DSSG relationships...")
-    alpha_weights = compute_predicate_weights(database_dir, RELATION_LABELS).to(device)
+    alpha_weights = compute_predicate_weights(database_dir, relation_labels, scene_tokens=dataset.scene_tokens).to(device)
     graph_loss = GraphPredictionLoss(alpha=alpha_weights).to(device)
     
     dynamic_loss = DynamicEdgeConsistencyLoss().to(device)
 
     history = []
+    resume_optimizer_state = None
+    start_epoch = 0
     if getattr(args, "resume_checkpoint", None) is not None:
         print(f"Warm-starting from checkpoint: {args.resume_checkpoint}")
         checkpoint = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
         missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
         history = checkpoint.get("history", [])
+        resume_optimizer_state = checkpoint.get("optimizer")
+        start_epoch = int(history[-1].get("epoch", len(history))) if history else 0
+        if start_epoch >= args.epochs:
+            print(f"Checkpoint already contains {start_epoch} epochs; target is {args.epochs}. Nothing to resume.")
+            return args.resume_checkpoint
+        print(f"Resuming at epoch {start_epoch + 1} of {args.epochs}.")
         if missing:
             print(f"Initialized new parameters: {len(missing)} tensors")
         if unexpected:
             print(f"Ignored checkpoint parameters: {len(unexpected)} tensors")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    if resume_optimizer_state is not None:
+        optimizer.load_state_dict(resume_optimizer_state)
+        print("Restored optimizer state from checkpoint.")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         totals = {
             "total": 0.0,
@@ -232,16 +276,24 @@ def train(args: argparse.Namespace) -> Path:
         progress = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
         for scene in progress:
             optimizer.zero_grad(set_to_none=True)
-            results = process_scene(
-                scene=scene,
-                scene_model=model.object_encoder,
-                association_model=model.association,
-                aggregation_model=model.aggregation,
-                temporal_model=model.temporal,
-                temporal_loss=temporal_loss,
-                representation_loss=representation_loss,
-                device=device,
-            )
+            if args.mode == "static":
+                results = process_static_scene(
+                    scene=scene,
+                    scene_model=model.object_encoder,
+                    representation_loss=representation_loss,
+                    device=device,
+                )
+            else:
+                results = process_scene(
+                    scene=scene,
+                    scene_model=model.object_encoder,
+                    association_model=model.association,
+                    aggregation_model=model.aggregation,
+                    temporal_model=model.temporal,
+                    temporal_loss=temporal_loss,
+                    representation_loss=representation_loss,
+                    device=device,
+                )
             if results is None:
                 continue
 
@@ -255,6 +307,8 @@ def train(args: argparse.Namespace) -> Path:
                 graph_loss_fn=graph_loss,
                 dynamic_loss_fn=dynamic_loss,
                 device=device,
+                relation_labels=relation_labels,
+                max_negative_ratio=args.negative_ratio,
             )
             
             total_loss = (
@@ -289,11 +343,15 @@ def train(args: argparse.Namespace) -> Path:
         torch.save(
             {
                 "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
                 "config": config.__dict__,
                 "label_to_id": label_to_id,
                 "id_to_label": id_to_label,
-                "relation_labels": RELATION_LABELS,
+                "relation_labels": relation_labels,
                 "history": history,
+                "seed": getattr(args, "seed", 42),
+                "mode": args.mode,
+                "database": str(database_dir),
             },
             checkpoint_path,
         )
@@ -310,11 +368,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-root", type=Path, default=ProjectPaths().reference_root)
     parser.add_argument("--output-root", type=Path, default=ProjectPaths().output_root)
     parser.add_argument("--database", type=Path, default=None)
+    parser.add_argument("--mode", choices=["static", "temporal"], default="temporal")
+    parser.add_argument("--train-scans", type=Path, default=None, help="Official 3DSSG train_scans.txt.")
+    parser.add_argument("--val-scans", type=Path, default=None, help="Official 3DSSG validation_scans.txt.")
+    parser.add_argument("--split-seed", type=int, default=42, help="Fallback seed when official split files are not provided.")
+    parser.add_argument("--seed", type=int, default=42, help="Reproducibility seed for training.")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-scenes", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
+    parser.add_argument("--negative-ratio", type=int, default=None, help="Optional negative-pair cap; omit for the official all-pairs protocol.")
     parser.add_argument("--lambda-temporal", type=float, default=1.0)
     parser.add_argument("--lambda-temporal-part", type=float, default=0.5)
     parser.add_argument("--lambda-node", type=float, default=1.0)

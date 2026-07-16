@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import ProjectPaths
@@ -40,6 +41,59 @@ class PointMAEObjectEncoder(nn.Module):
         return torch.max(feature, dim=2)[0].reshape(b, g, self.encoder_channel)
 
 
+
+class _OfficialSTN3d(nn.Module):
+    """Architecture used by the official OCRL object-encoder checkpoint."""
+
+    def __init__(self, channel: int = 9, out_dim: int = 512):
+        super().__init__()
+        self.conv1 = nn.Conv1d(channel, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, out_dim, 1)
+        self.fc1 = nn.Linear(out_dim, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(out_dim)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, dim=2, keepdim=True)[0].reshape(batch_size, -1)
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x).reshape(batch_size, 3, 3)
+        return x + torch.eye(3, dtype=x.dtype, device=x.device).unsqueeze(0)
+
+
+class OfficialPointNetEncoder(nn.Module):
+    """Official OCRL 9-channel PointNet with access to per-point tokens."""
+
+    def __init__(self, channel: int = 9, out_dim: int = 512):
+        super().__init__()
+        self.stn = _OfficialSTN3d(channel=channel, out_dim=out_dim)
+        self.conv1 = nn.Conv1d(channel, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, out_dim, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(out_dim)
+
+    def forward_point_tokens(self, points: torch.Tensor) -> torch.Tensor:
+        """Encode [B, 9, N] object points as [B, N, 512] pretrained tokens."""
+        _, channels, _ = points.shape
+        transform = self.stn(points)
+        xyz = torch.bmm(points[:, :3].transpose(2, 1), transform).transpose(2, 1)
+        features = torch.cat([xyz, points[:, 3:]], dim=1) if channels > 3 else xyz
+        x = F.relu(self.bn1(self.conv1(features)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        return x.transpose(1, 2)
 def preprocess_object_points(points: np.ndarray, num_points: int = 1024) -> np.ndarray:
     points = points.T.astype(np.float32)
     centroid = np.mean(points, axis=0)
@@ -57,11 +111,11 @@ def preprocess_object_points(points: np.ndarray, num_points: int = 1024) -> np.n
     return points[idx]
 
 
-def farthest_point_sampling(points: np.ndarray, num_centers: int = 64):
+def farthest_point_sampling(points: np.ndarray, num_centers: int = 64, initial_index: int | None = None):
     n = points.shape[0]
     centers = np.zeros(num_centers, dtype=np.int64)
     distances = np.ones(n) * 1e10
-    farthest = np.random.randint(0, n)
+    farthest = int(initial_index) % n if initial_index is not None else np.random.randint(0, n)
     for i in range(num_centers):
         centers[i] = farthest
         centroid = points[farthest]

@@ -46,6 +46,8 @@ class PipelineConfig:
 
     dim: int = 384
     num_parts: int = 7
+    # Category-name prompts remain representation supervision only in SGCls.
+    graph_use_text: bool = False
     num_heads: int = 8
     fusion_layers: int = 4
     temporal_layers: int = 4

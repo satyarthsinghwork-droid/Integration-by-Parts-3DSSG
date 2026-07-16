@@ -8,7 +8,11 @@ import torch.nn.functional as F
 class ComponentDiversityLoss(nn.Module):
     """Slide 36: keep learned parts distinct."""
 
-    def forward(self, components: torch.Tensor) -> torch.Tensor:
+    def forward(self, components: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if mask is not None:
+            components = components[mask]
+        if components.numel() == 0:
+            return components.new_zeros(())
         components = F.normalize(components, dim=-1)
         sim = torch.matmul(components, components.transpose(-2, -1))
         k = sim.size(-1)
@@ -24,7 +28,17 @@ class PartAlignmentLoss(nn.Module):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, rgb_components: torch.Tensor, lidar_components: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        rgb_components: torch.Tensor,
+        lidar_components: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if mask is not None:
+            rgb_components = rgb_components[mask]
+            lidar_components = lidar_components[mask]
+        if rgb_components.numel() == 0:
+            return lidar_components.new_zeros(())
         b, k, d = rgb_components.shape
         rgb = F.normalize(rgb_components.reshape(b * k, d), dim=-1)
         lidar = F.normalize(lidar_components.reshape(b * k, d), dim=-1)
@@ -34,25 +48,54 @@ class PartAlignmentLoss(nn.Module):
 
 
 class ObjectContrastiveLoss(nn.Module):
-    """Slide 39: CLIP-style consistency for LiDAR/RGB/text object embeddings."""
+    """Slide 39 object alignment without treating same-class prompts as negatives."""
 
     def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
 
-    def clip_loss(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        a = F.normalize(a, dim=-1)
-        b = F.normalize(b, dim=-1)
-        logits = torch.matmul(a, b.T) / self.temperature
-        labels = torch.arange(logits.size(0), device=logits.device)
-        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+    def _multi_positive_loss(self, a: torch.Tensor, b: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
+        if a.numel() == 0:
+            return b.new_zeros(())
+        logits = torch.matmul(F.normalize(a, dim=-1), F.normalize(b, dim=-1).T) / self.temperature
+        positive = positive.to(device=logits.device, dtype=torch.bool)
+        if not positive.any(dim=1).all() or not positive.any(dim=0).all():
+            raise ValueError("Every aligned object must have at least one positive target.")
+        log_denom_a = torch.logsumexp(logits, dim=1)
+        log_num_a = torch.logsumexp(logits.masked_fill(~positive, float("-inf")), dim=1)
+        log_denom_b = torch.logsumexp(logits, dim=0)
+        log_num_b = torch.logsumexp(logits.masked_fill(~positive, float("-inf")), dim=0)
+        return -0.5 * ((log_num_a - log_denom_a).mean() + (log_num_b - log_denom_b).mean())
 
-    def forward(self, rgb_object: torch.Tensor, lidar_object: torch.Tensor, text_object: torch.Tensor) -> torch.Tensor:
-        return (
-            self.clip_loss(rgb_object, lidar_object)
-            + self.clip_loss(lidar_object, text_object)
-            + self.clip_loss(rgb_object, text_object)
-        ) / 3.0
+    def _same_category_mask(self, categories: list[str], device: torch.device) -> torch.Tensor:
+        return torch.tensor(
+            [[left == right for right in categories] for left in categories],
+            device=device,
+            dtype=torch.bool,
+        )
+
+    def forward(
+        self,
+        rgb_object: torch.Tensor,
+        lidar_object: torch.Tensor,
+        text_object: torch.Tensor,
+        category_ids: list[str],
+        rgb_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        category_positive = self._same_category_mask(category_ids, lidar_object.device)
+        losses = [self._multi_positive_loss(lidar_object, text_object, category_positive)]
+        if rgb_mask is not None:
+            rgb_mask = rgb_mask.to(device=lidar_object.device, dtype=torch.bool)
+        if rgb_mask is None or rgb_mask.any():
+            if rgb_mask is None:
+                rgb_mask = torch.ones(lidar_object.size(0), device=lidar_object.device, dtype=torch.bool)
+            rgb_categories = [category for category, available in zip(category_ids, rgb_mask.tolist()) if available]
+            count = len(rgb_categories)
+            instance_positive = torch.eye(count, device=lidar_object.device, dtype=torch.bool)
+            text_positive = self._same_category_mask(rgb_categories, lidar_object.device)
+            losses.append(self._multi_positive_loss(rgb_object[rgb_mask], lidar_object[rgb_mask], instance_positive))
+            losses.append(self._multi_positive_loss(rgb_object[rgb_mask], text_object[rgb_mask], text_positive))
+        return torch.stack(losses).mean()
 
 
 class RepresentationLoss(nn.Module):
@@ -66,10 +109,19 @@ class RepresentationLoss(nn.Module):
         self.part_alignment = PartAlignmentLoss(temperature=temperature)
         self.object_alignment = ObjectContrastiveLoss(temperature=temperature)
 
-    def forward(self, outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        diversity = self.diversity(outputs["rgb_components"]) + self.diversity(outputs["lidar_components"])
-        part_align = self.part_alignment(outputs["rgb_components"], outputs["lidar_components"])
-        object_loss = self.object_alignment(outputs["rgb_object"], outputs["lidar_object"], outputs["text_object"])
+    def forward(self, outputs: dict[str, torch.Tensor], category_ids: list[str]) -> dict[str, torch.Tensor]:
+        rgb_mask = outputs.get("has_rgb_mask")
+        if rgb_mask is not None:
+            rgb_mask = rgb_mask.to(device=outputs["rgb_components"].device, dtype=torch.bool)
+        diversity = self.diversity(outputs["lidar_components"]) + self.diversity(outputs["rgb_components"], rgb_mask)
+        part_align = self.part_alignment(outputs["rgb_components"], outputs["lidar_components"], rgb_mask)
+        object_loss = self.object_alignment(
+            outputs["rgb_object"],
+            outputs["lidar_object"],
+            outputs["text_object"],
+            category_ids=category_ids,
+            rgb_mask=rgb_mask,
+        )
         part_loss = diversity + part_align
         total = self.lambda_part * part_loss + self.lambda_object * object_loss
         return {
@@ -162,7 +214,7 @@ class TemporalPartAlignmentLoss(nn.Module):
 
 
 class GraphPredictionLoss(nn.Module):
-    """Slide 43: node cross-entropy and focal edge relation loss."""
+    """Node cross-entropy plus a multi-label focal loss for 26 relation outputs."""
 
     def __init__(self, focal_gamma: float = 2.0, alpha: torch.Tensor | None = None, lambda_lse: float = 0.1):
         super().__init__()
@@ -170,19 +222,21 @@ class GraphPredictionLoss(nn.Module):
         self.lambda_lse = lambda_lse
         self.register_buffer("alpha", alpha)
 
-    def edge_focal_loss(self, edge_logits: torch.Tensor, edge_labels: torch.Tensor) -> torch.Tensor:
-        log_prob = F.log_softmax(edge_logits, dim=-1)
-        prob = log_prob.exp()
-        labels = edge_labels.view(-1, 1)
-        pt = prob.gather(1, labels).squeeze(1).clamp_min(1e-8)
-        log_pt = log_prob.gather(1, labels).squeeze(1)
-        
-        loss = -((1.0 - pt) ** self.focal_gamma) * log_pt
+    def edge_focal_loss(self, edge_logits: torch.Tensor, edge_targets: torch.Tensor) -> torch.Tensor:
+        if edge_logits.shape != edge_targets.shape:
+            raise ValueError(
+                f"Expected multi-label edge targets shaped {tuple(edge_logits.shape)}, got {tuple(edge_targets.shape)}."
+            )
+        targets = edge_targets.to(device=edge_logits.device, dtype=edge_logits.dtype)
+        probabilities = torch.sigmoid(edge_logits)
+        bce = F.binary_cross_entropy_with_logits(edge_logits, targets, reduction="none")
+        pt = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
+        loss = (1.0 - pt).pow(self.focal_gamma) * bce
+
         if self.alpha is not None:
-            # apply alpha weighting based on ground truth class
-            alpha_weights = self.alpha[edge_labels]
-            loss = loss * alpha_weights
-            
+            positive_weights = self.alpha.to(device=edge_logits.device, dtype=edge_logits.dtype).view(1, -1)
+            weights = targets * positive_weights + (1.0 - targets)
+            loss = loss * weights
         return loss.mean()
 
     def forward(

@@ -11,7 +11,13 @@ from .data import stack_frame_tensors
 
 def encode_frame(frame: dict[str, Any], scene_model: torch.nn.Module, device: torch.device | str) -> dict[str, Any]:
     rgb_tokens, lidar_tokens, text_features = stack_frame_tensors(frame, device=device)
-    outputs = scene_model(rgb_tokens, lidar_tokens, text_features)
+    has_rgb = torch.tensor(
+        [bool(obj.get("has_rgb", True)) for obj in frame["objects"]],
+        dtype=torch.bool,
+        device=rgb_tokens.device,
+    )
+    outputs = scene_model(rgb_tokens, lidar_tokens, text_features, has_rgb_mask=has_rgb)
+    outputs["has_rgb_mask"] = has_rgb
     return {
         "sample_token": frame["sample_token"],
         "timestamp": frame["timestamp"],
@@ -33,7 +39,7 @@ def encode_scene(
         frame_encoded = encode_frame(frame, scene_model, device=device)
         encoded.append(frame_encoded)
         if representation_loss is not None:
-            rep_losses.append(representation_loss(frame_encoded["outputs"])["representation_loss"])
+            rep_losses.append(representation_loss(frame_encoded["outputs"], [str(obj.get("category_name", "unknown")) for obj in frame["objects"]])["representation_loss"])
 
     if rep_losses:
         rep_loss = torch.stack(rep_losses).mean()
@@ -134,6 +140,59 @@ def process_scene(
         "mask": mask,
         "instance_tokens": instance_tokens,
         "temporal_embeddings": temporal_embeddings,
+    }
+
+
+
+def process_static_scene(
+    scene: dict[str, Any],
+    scene_model: torch.nn.Module,
+    representation_loss: torch.nn.Module | None = None,
+    device: torch.device | str = "cpu",
+) -> dict[str, Any] | None:
+    """Encode a scene as static multi-modal object representations.
+
+    This is for fair 3DSSG-style comparison: every object gets one embedding.
+    If a scene has multiple frames, the first available occurrence of each object is used.
+    Static databases usually contain exactly one frame.
+    """
+    object_by_instance: dict[str, dict[str, Any]] = {}
+    for frame in scene.get("frames", []):
+        for obj in frame.get("objects", []):
+            token = obj.get("instance_token")
+            if token is not None and token not in object_by_instance:
+                object_by_instance[token] = obj
+
+    objects = list(object_by_instance.values())
+    if not objects:
+        return None
+
+    static_frame = {
+        "sample_token": scene.get("scene_token", "static_scene"),
+        "timestamp": 0,
+        "objects": objects,
+    }
+    encoded = encode_frame(static_frame, scene_model, device=device)
+    if representation_loss is not None:
+        rep_loss = representation_loss(encoded["outputs"], [str(obj.get("category_name", "unknown")) for obj in objects])["representation_loss"]
+    else:
+        rep_loss = encoded["embeddings"].new_zeros(())
+
+    embeddings = encoded["embeddings"].unsqueeze(1)
+    mask = torch.ones(embeddings.size(0), 1, dtype=torch.bool, device=embeddings.device)
+    instance_tokens = [obj["instance_token"] for obj in objects]
+    zero = embeddings.new_zeros(())
+    return {
+        "loss": rep_loss,
+        "representation_loss": rep_loss,
+        "temporal_loss": zero,
+        "encoded_scene": [encoded],
+        "tracklets": {token: [embeddings[idx, 0]] for idx, token in enumerate(instance_tokens)},
+        "associations": [],
+        "padded_tracklets": embeddings,
+        "mask": mask,
+        "instance_tokens": instance_tokens,
+        "temporal_embeddings": embeddings,
     }
 
 
