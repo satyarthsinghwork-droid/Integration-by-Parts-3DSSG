@@ -216,10 +216,11 @@ class TemporalPartAlignmentLoss(nn.Module):
 class GraphPredictionLoss(nn.Module):
     """Node cross-entropy plus a multi-label focal loss for 26 relation outputs."""
 
-    def __init__(self, focal_gamma: float = 2.0, alpha: torch.Tensor | None = None, lambda_lse: float = 0.1):
+    def __init__(self, focal_gamma: float = 2.0, alpha: torch.Tensor | None = None, lambda_lse: float = 0.1, negative_weight: float = 1.0):
         super().__init__()
         self.focal_gamma = focal_gamma
         self.lambda_lse = lambda_lse
+        self.negative_weight = negative_weight
         self.register_buffer("alpha", alpha)
 
     def edge_focal_loss(self, edge_logits: torch.Tensor, edge_targets: torch.Tensor) -> torch.Tensor:
@@ -233,11 +234,21 @@ class GraphPredictionLoss(nn.Module):
         pt = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
         loss = (1.0 - pt).pow(self.focal_gamma) * bce
 
-        if self.alpha is not None:
+        positive_mask = targets > 0.5
+        negative_mask = ~positive_mask
+        if self.alpha is None:
+            positive_weights = torch.ones((1, targets.size(1)), dtype=targets.dtype, device=targets.device)
+        else:
             positive_weights = self.alpha.to(device=edge_logits.device, dtype=edge_logits.dtype).view(1, -1)
-            weights = targets * positive_weights + (1.0 - targets)
-            loss = loss * weights
-        return loss.mean()
+
+        # Relation labels are extremely sparse. Average positive and negative
+        # terms separately so thousands of easy absent-predicate labels cannot
+        # collapse the edge loss to a misleading near-zero value.
+        weighted_positive = loss * positive_mask * positive_weights
+        positive_norm = (positive_mask * positive_weights).sum().clamp_min(1.0)
+        positive_loss = weighted_positive.sum() / positive_norm
+        negative_loss = loss[negative_mask].mean() if negative_mask.any() else loss.new_zeros(())
+        return positive_loss + self.negative_weight * negative_loss
 
     def forward(
         self,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import random
 from typing import Any
 
 import torch
@@ -98,8 +100,12 @@ def build_official_3dssg_edges(
                 negatives.append(item)
 
     if max_negative_ratio is not None and positives:
+        # Deterministic per-scene negative sampling prevents all-zero labels
+        # from dominating the relation objective while keeping runs reproducible.
+        seed_material = "|".join(str(obj["instance_token"]) for obj in scene_objects)
+        seed = int(hashlib.sha256(seed_material.encode("utf-8")).hexdigest()[:16], 16)
+        random.Random(seed).shuffle(negatives)
         negatives = negatives[: max_negative_ratio * len(positives)]
-
     selected = positives + negatives
     if not selected:
         return (
@@ -161,23 +167,34 @@ def edge_geometric_features(
     objects: list[dict[str, Any]],
     edge_index: torch.Tensor,
     device: torch.device | str,
+    extended_geometry: bool = False,
 ) -> torch.Tensor:
-    """Build the base paper's 11-D directed spatial descriptor."""
+    """Build directed spatial features; v3 appends distance, direction and AABB IoU."""
+    geom_dim = 16 if extended_geometry else 11
     if edge_index.numel() == 0:
-        return torch.empty(0, 11, dtype=torch.float32, device=device)
+        return torch.empty(0, geom_dim, dtype=torch.float32, device=device)
 
     spatial = torch.stack([_object_spatial_vector(obj, device) for obj in objects], dim=0)
     source = spatial[edge_index[:, 0].to(spatial.device)]
     target = spatial[edge_index[:, 1].to(spatial.device)]
-
     center_delta = source[:, 0:3] - target[:, 0:3]
     spread_delta = source[:, 3:6] - target[:, 3:6]
     size_delta = source[:, 6:9] - target[:, 6:9]
     volume_ratio = torch.log(source[:, 9:10].clamp_min(1e-6) / target[:, 9:10].clamp_min(1e-6))
     side_ratio = torch.log(source[:, 10:11].clamp_min(1e-6) / target[:, 10:11].clamp_min(1e-6))
-    features = torch.cat([center_delta, spread_delta, size_delta, volume_ratio, side_ratio], dim=-1)
-    return torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
-
+    features = [center_delta, spread_delta, size_delta, volume_ratio, side_ratio]
+    if extended_geometry:
+        distance = torch.linalg.vector_norm(center_delta, dim=-1, keepdim=True)
+        direction = center_delta / distance.clamp_min(1e-6)
+        source_min, source_max = source[:, 0:3] - source[:, 6:9] / 2, source[:, 0:3] + source[:, 6:9] / 2
+        target_min, target_max = target[:, 0:3] - target[:, 6:9] / 2, target[:, 0:3] + target[:, 6:9] / 2
+        intersection = (torch.minimum(source_max, target_max) - torch.maximum(source_min, target_min)).clamp_min(0)
+        intersection_volume = intersection.prod(dim=-1, keepdim=True)
+        source_volume = source[:, 6:9].clamp_min(1e-6).prod(dim=-1, keepdim=True)
+        target_volume = target[:, 6:9].clamp_min(1e-6).prod(dim=-1, keepdim=True)
+        iou = intersection_volume / (source_volume + target_volume - intersection_volume).clamp_min(1e-6)
+        features.extend([distance, direction, iou])
+    return torch.nan_to_num(torch.cat(features, dim=-1), nan=0.0, posinf=10.0, neginf=-10.0)
 
 def node_labels_for_objects(
     objects: list[dict[str, Any]],

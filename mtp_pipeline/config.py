@@ -48,6 +48,13 @@ class PipelineConfig:
     num_parts: int = 7
     # Category-name prompts remain representation supervision only in SGCls.
     graph_use_text: bool = False
+    # Versioned v3 experiment: respect padded multi-view RGB tokens.
+    use_rgb_token_mask: bool = False
+    # Versioned v3 experiment: extend relation geometry from 11 to 16 dimensions.
+    extended_geometry: bool = False
+    # Optional v4 graph-only ablation; legacy Transformer context remains the default.
+    graph_context: str = "transformer"
+    graph_knn_neighbors: int = 0
     num_heads: int = 8
     fusion_layers: int = 4
     temporal_layers: int = 4

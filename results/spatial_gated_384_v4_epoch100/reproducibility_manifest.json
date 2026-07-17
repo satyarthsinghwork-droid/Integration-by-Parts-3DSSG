@@ -1,0 +1,92 @@
+{
+  "experiment": "official_static_spatial_gated_384_v4",
+  "archive_branch": "spatial-gated-384-v4-epoch100",
+  "source_base_commit": "d800f1e55c542848e36532f073c89255e9a75750",
+  "protocol": {
+    "name": "OCRL-3DSSG official subset",
+    "object_classes": 160,
+    "positive_relation_classes": 26,
+    "train_scan_ids": 1178,
+    "validation_scan_ids": 157,
+    "total_scan_ids": 1335,
+    "train_database_entries": 3852,
+    "validation_database_entries": 548,
+    "total_database_entries": 4400,
+    "generated_label_space_sha256": "405D03BB70A19B5FF499A07E49A47217A0CA1FD77347E443446F31DCAF984B51"
+  },
+  "configuration": {
+    "seed": 42,
+    "mode": "static",
+    "epochs": 100,
+    "learning_rate": 0.0001,
+    "embedding_dim": 384,
+    "num_parts": 7,
+    "use_rgb_token_mask": false,
+    "extended_geometry": false,
+    "graph_context": "spatial_gated",
+    "graph_knn_neighbors": 8,
+    "lr_schedule": "cosine",
+    "edge_warmup_epochs": 10,
+    "edge_warmup_start": 0.2,
+    "negative_ratio": null,
+    "edge_negative_weight": 1.0,
+    "lambda_temporal": 0.0,
+    "lambda_temporal_part": 0.0,
+    "lambda_node": 1.0,
+    "lambda_edge": 1.0,
+    "lambda_dynamic": 0.0,
+    "grad_clip": 1.0,
+    "shuffle": true,
+    "ablation": "none",
+    "modalities": {
+      "text": "global CLIP ViT-B/32 category embedding",
+      "lidar": "official pretrained PointNet XYZ+RGB+normals object tokens",
+      "rgb": "one largest-valid CLIP ViT-B/32 object crop"
+    }
+  },
+  "environment": {
+    "python": "3.11.3",
+    "torch": "2.6.0+cu124",
+    "numpy": "2.4.6",
+    "tqdm": "4.67.3",
+    "transformers": "5.12.1",
+    "opencv": "4.11.0",
+    "Pillow": "11.3.0",
+    "pandas": "2.3.2"
+  },
+  "artifacts": {
+    "run_3rscan_spatial_gated_384_v4.ipynb": {
+      "bytes": 30711,
+      "sha256": "CB478D4BF99FA12E18CB9DED7EBC958D05B4896A02A4413F644CC157DF612664"
+    },
+    "results/baseline_epoch50_evaluation.json": {
+      "bytes": 2167,
+      "sha256": "C3F2CE0388726AE1CE2902DA53AD7335A0378D507C01AD22555B67E2A13FB7DF"
+    },
+    "results/spatial_gated_384_v4_epoch100/training_history_3rscan.json": {
+      "bytes": 34668,
+      "sha256": "1731E882A06B8A8E50467AEE93A65EC5F53DC307A910C73DB6DAD41B4A58DC75"
+    },
+    "results/spatial_gated_384_v4_epoch100/checkpoints/evaluation_official_integration_by_parts_3rscan_epoch_100.json": {
+      "bytes": 2166,
+      "sha256": "EFE882154E547841819A30874F28F7980F86291ECC4DFFFFF12DAFC1971D3F74"
+    },
+    "results/spatial_gated_384_v4_epoch100/checkpoints/integration_by_parts_3rscan_epoch_100.pt": {
+      "bytes": 159409246,
+      "sha256": "498C6159DA175BBA4C70F155E41B2B006F3605D8460FBDA347D3D1FE6FE5CFFE",
+      "storage": "git-lfs"
+    },
+    "reference/pretrained/obj_enc.pth": {
+      "bytes": 2237303,
+      "sha256": "7D14A73E5C26E83F03C3933B73C2B70F2E022225D0286A8B18007C23A29AAF24"
+    }
+  },
+  "official_split_sha256": {
+    "classes.txt": "5624C870092C00F35ECF0323212313E6A8AF8CF79C184C554BD68AF70A4E4DFD",
+    "relations.txt": "8271C97361D803F48DEC28BCCF897523ACCFBF493FBAFE5037F39D76EC355BD5",
+    "relationships_train.json": "4FCAC82CA184C8F943DDD59EA8046ED6D5E650538752C1D77614F40E781A28E8",
+    "relationships_validation.json": "A3B96637DF20DAC27F03F631BEE9DB409F4B22F65EC6205FF007CED73E52911E",
+    "train_scans.txt": "E0843B27B4A3FAD83BA340273207BB4B031F653F988F2D5850B81CB0DEC854BB",
+    "validation_scans.txt": "A3CE6F256ADD950EA74E15680C5743E34351BC3CE663DC3A3AA5BD9CF4A6C2D9"
+  }
+}

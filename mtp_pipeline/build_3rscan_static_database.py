@@ -23,9 +23,14 @@ def _read_lines(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _select_static_rgb_tokens(rgb_scene: dict[str, Any] | None) -> dict[str, torch.Tensor]:
-    """Choose one deterministic, most-visible crop for each static object."""
-    selected: dict[str, tuple[float, int, torch.Tensor]] = {}
+def _select_static_rgb_tokens(
+    rgb_scene: dict[str, Any] | None,
+    max_views: int = 1,
+    tokens_per_view: int = 49,
+    feature_dim: int = 768,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Pack top visible RGB views into fixed-size tokens plus a validity mask."""
+    candidates: dict[str, list[tuple[float, int, torch.Tensor]]] = defaultdict(list)
     if not rgb_scene:
         return {}
     for frame_index, frame in enumerate(rgb_scene.get("frames", [])):
@@ -35,11 +40,19 @@ def _select_static_rgb_tokens(rgb_scene: dict[str, Any] | None) -> dict[str, tor
                 continue
             bbox = obj.get("bbox", [0.0, 0.0, 0.0, 0.0])
             area = max(float(bbox[2]) - float(bbox[0]), 0.0) * max(float(bbox[3]) - float(bbox[1]), 0.0)
-            instance = str(obj["instance_token"])
-            candidate = (area, -frame_index, tokens.float().cpu())
-            if instance not in selected or candidate[:2] > selected[instance][:2]:
-                selected[instance] = candidate
-    return {instance: value[2] for instance, value in selected.items()}
+            candidates[str(obj["instance_token"])].append((area, frame_index, tokens.float().cpu()))
+    packed: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    total_tokens = max_views * tokens_per_view
+    for instance, views in candidates.items():
+        output = torch.zeros(total_tokens, feature_dim, dtype=torch.float32)
+        mask = torch.zeros(total_tokens, dtype=torch.bool)
+        for view_index, (_area, _frame, tokens) in enumerate(sorted(views, key=lambda item: (-item[0], item[1]))[:max_views]):
+            usable = min(tokens.size(0), tokens_per_view)
+            start = view_index * tokens_per_view
+            output[start : start + usable, : min(tokens.size(1), feature_dim)] = tokens[:usable, :feature_dim]
+            mask[start : start + usable] = True
+        packed[instance] = (output, mask)
+    return packed
 
 def _load_official_scans(official_subset_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     """Load the official OCRL 3DSSG subset and retain its canonical ordering."""
@@ -97,6 +110,7 @@ def build_3rscan_static_scene_database(
     rgb_dir: Path | None = None,
     rgb_fallback_tokens: int = 49,
     rgb_dim: int = 768,
+    rgb_views_per_object: int = 1,
     official_subset_dir: Path | None = None,
 ) -> int:
     """Build static scenes using the official OCRL/3DSSG labels when supplied.
@@ -114,6 +128,8 @@ def build_3rscan_static_scene_database(
         scans, object_labels, relation_labels = _legacy_scans(objects_json, relationships_json)
         protocol = "legacy local labels; not comparable to the OCRL 3DSSG protocol"
 
+    if rgb_views_per_object < 1:
+        raise ValueError("rgb_views_per_object must be at least one.")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / LABEL_SPACE_FILE).write_text(
         json.dumps(
@@ -125,7 +141,7 @@ def build_3rscan_static_scene_database(
                 "num_relation_classes": len(relation_labels),
                 "reference_scan_groups": len({str(scan["scan"]) for scan in scans}),
                 "annotation_entries": len(scans),
-                "rgb_policy": "one largest-visible crop per object; unavailable RGB is masked",
+                "rgb_policy": f"top-{rgb_views_per_object} largest-visible RGB views per object; unavailable RGB is masked",
                 "lidar_requirement": "official pretrained PointNet tokens with world-space point_stats",
             },
             indent=2,
@@ -137,7 +153,8 @@ def build_3rscan_static_scene_database(
     allowed_relations = set(relation_labels)
     saved = 0
     skipped_without_objects = 0
-    zero_rgb = torch.zeros(rgb_fallback_tokens, rgb_dim, dtype=torch.float32)
+    zero_rgb = torch.zeros(rgb_fallback_tokens * rgb_views_per_object, rgb_dim, dtype=torch.float32)
+    zero_rgb_mask = torch.zeros(rgb_fallback_tokens * rgb_views_per_object, dtype=torch.bool)
 
     for scan in tqdm(scans, desc="Building official static 3DSSG database"):
         scan_id = str(scan["scan"])
@@ -147,11 +164,16 @@ def build_3rscan_static_scene_database(
             # A timed-out build can safely resume because each scene is self-contained.
             saved += 1
             continue
-        rgb_by_instance: dict[str, torch.Tensor] = {}
+        rgb_by_instance: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if rgb_dir is not None:
             rgb_path = rgb_dir / f"{scan_id}.pt"
             if rgb_path.exists():
-                rgb_by_instance = _select_static_rgb_tokens(load_token_file(rgb_path))
+                rgb_by_instance = _select_static_rgb_tokens(
+                    load_token_file(rgb_path),
+                    max_views=rgb_views_per_object,
+                    tokens_per_view=rgb_fallback_tokens,
+                    feature_dim=rgb_dim,
+                )
 
         objects_out: list[dict[str, Any]] = []
         for raw_id, category_name in scan.get("objects", {}).items():
@@ -175,12 +197,14 @@ def build_3rscan_static_scene_database(
             centroid_3d = torch.tensor(point_stats["center"], dtype=torch.float32)
             std_3d = torch.tensor(point_stats["std"], dtype=torch.float32)
             bbox_3d = torch.tensor(point_stats["bbox_size"], dtype=torch.float32)
+            rgb_tokens, rgb_token_mask = rgb_by_instance.get(obj_id, (zero_rgb, zero_rgb_mask))
             objects_out.append(
                 {
                     "instance_token": obj_id,
                     "category_name": category_name,
                     "bbox": [0, 0, 1, 1],
-                    "patch_tokens": rgb_by_instance.get(obj_id, zero_rgb).clone(),
+                    "patch_tokens": rgb_tokens.clone(),
+                    "rgb_token_mask": rgb_token_mask.clone(),
                     "lidar_tokens": lidar_data["lidar_tokens"].float().cpu(),
                     "text_features": text_data["text_features"].float().cpu(),
                     "num_points": lidar_data.get("num_points", 0),

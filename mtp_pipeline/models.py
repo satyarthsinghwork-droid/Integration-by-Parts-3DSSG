@@ -40,15 +40,28 @@ class CrossAttention(nn.Module):
         self.wk = nn.Linear(dim, dim)
         self.wv = nn.Linear(dim, dim)
 
-    def forward(self, queries: torch.Tensor, tokens: torch.Tensor):
+    def forward(
+        self,
+        queries: torch.Tensor,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ):
         q = self.wq(queries)
         k = self.wk(tokens)
         v = self.wv(tokens)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-        attention = torch.softmax(scores, dim=-1)
+        if token_mask is not None:
+            token_mask = token_mask.to(device=tokens.device, dtype=torch.bool)
+            if token_mask.shape != tokens.shape[:2]:
+                raise ValueError(f"Expected token mask {tuple(tokens.shape[:2])}, got {tuple(token_mask.shape)}.")
+            valid = token_mask.any(dim=1, keepdim=True).unsqueeze(1)
+            scores = scores.masked_fill(~token_mask.unsqueeze(1), -1e4)
+            attention = torch.softmax(scores, dim=-1)
+            attention = torch.where(valid, attention, torch.zeros_like(attention))
+        else:
+            attention = torch.softmax(scores, dim=-1)
         components = torch.matmul(attention, v)
         return components, attention
-
 
 class ObjectPooling(nn.Module):
     """Attention pooling from components to modality-specific object embeddings."""
@@ -73,11 +86,17 @@ class MultimodalComponentEncoder(nn.Module):
         self.lidar_attention = CrossAttention(dim=dim)
         self.pool = ObjectPooling(dim=dim)
 
-    def forward(self, rgb_tokens: torch.Tensor, lidar_tokens: torch.Tensor, text_features: torch.Tensor):
+    def forward(
+        self,
+        rgb_tokens: torch.Tensor,
+        lidar_tokens: torch.Tensor,
+        text_features: torch.Tensor,
+        rgb_token_mask: torch.Tensor | None = None,
+    ):
         rgb_tokens, lidar_tokens, text_object = self.projector(rgb_tokens, lidar_tokens, text_features)
         queries = self.query_layer(rgb_tokens.size(0))
 
-        rgb_components, rgb_attention = self.rgb_attention(queries, rgb_tokens)
+        rgb_components, rgb_attention = self.rgb_attention(queries, rgb_tokens, token_mask=rgb_token_mask)
         lidar_components, lidar_attention = self.lidar_attention(queries, lidar_tokens)
         rgb_object, rgb_alpha = self.pool(rgb_components)
         lidar_object, lidar_alpha = self.pool(lidar_components)
@@ -139,11 +158,13 @@ class SceneRepresentationModel(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         graph_use_text: bool = False,
+        use_rgb_token_mask: bool = False,
     ):
         super().__init__()
         self.component_encoder = MultimodalComponentEncoder(dim=dim, num_parts=num_parts)
         self.fusion = FusionTransformer(dim=dim, num_heads=num_heads, num_layers=num_layers, dropout=dropout)
         self.graph_use_text = graph_use_text
+        self.use_rgb_token_mask = use_rgb_token_mask
 
     def forward(
         self,
@@ -151,8 +172,14 @@ class SceneRepresentationModel(nn.Module):
         lidar_tokens: torch.Tensor,
         text_features: torch.Tensor,
         has_rgb_mask: torch.Tensor | None = None,
+        rgb_token_mask: torch.Tensor | None = None,
     ):
-        outputs = self.component_encoder(rgb_tokens, lidar_tokens, text_features)
+        outputs = self.component_encoder(
+            rgb_tokens,
+            lidar_tokens,
+            text_features,
+            rgb_token_mask=rgb_token_mask if self.use_rgb_token_mask else None,
+        )
         if has_rgb_mask is not None:
             outputs["has_rgb_mask"] = has_rgb_mask.to(device=outputs["rgb_object"].device, dtype=torch.bool)
         # The 3DSSG text vector is generated from the annotated class name.
@@ -278,12 +305,60 @@ class EdgeClassifier(nn.Module):
         return self.classifier(hidden), self.geom_reconstruct(hidden)
 
 
+class SpatialBidirectionalContext(nn.Module):
+    """Geometry-aware KNN message passing with independently gated directions."""
+
+    def __init__(self, dim: int, geom_dim: int, neighbors: int, dropout: float = 0.1):
+        super().__init__()
+        self.neighbors = neighbors
+        self.geom = nn.Sequential(nn.LayerNorm(geom_dim), nn.Linear(geom_dim, dim), nn.GELU())
+        self.message = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Sequential(nn.Linear(dim * 3, dim), nn.GELU(), nn.Linear(dim, 1))
+        self.update = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Dropout(dropout))
+        self.norm = nn.LayerNorm(dim)
+
+    def _knn_edges(self, edge_index: torch.Tensor, geometry: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        if self.neighbors <= 0 or edge_index.numel() == 0:
+            return torch.arange(edge_index.size(0), device=edge_index.device)
+        distance = torch.linalg.vector_norm(geometry[:, :3], dim=-1)
+        selected: list[torch.Tensor] = []
+        for target in range(num_nodes):
+            candidates = torch.nonzero(edge_index[:, 1] == target, as_tuple=False).flatten()
+            if candidates.numel() <= self.neighbors:
+                selected.append(candidates)
+            elif candidates.numel():
+                nearest = torch.topk(distance[candidates], self.neighbors, largest=False).indices
+                selected.append(candidates[nearest])
+        return torch.cat(selected) if selected else edge_index.new_empty((0,), dtype=torch.long)
+
+    def forward(self, node_features: torch.Tensor, edge_index: torch.Tensor, geometry: torch.Tensor | None) -> torch.Tensor:
+        if node_features.numel() == 0 or edge_index.numel() == 0 or geometry is None:
+            return node_features
+        selected = self._knn_edges(edge_index, geometry, node_features.size(0))
+        if selected.numel() == 0:
+            return node_features
+        edges = edge_index[selected]
+        geom = self.geom(geometry[selected].to(dtype=node_features.dtype))
+        source, target = edges[:, 0], edges[:, 1]
+        source_features = node_features[source]
+        target_features = node_features[target]
+        gate = torch.sigmoid(self.gate(torch.cat([source_features, target_features, geom], dim=-1)))
+        messages = gate * (self.message(source_features) + geom)
+        aggregated = torch.zeros_like(node_features)
+        aggregated.index_add_(0, target, messages)
+        counts = torch.zeros((node_features.size(0), 1), dtype=node_features.dtype, device=node_features.device)
+        counts.index_add_(0, target, torch.ones((target.numel(), 1), dtype=node_features.dtype, device=node_features.device))
+        return self.norm(node_features + self.update(aggregated / counts.clamp_min(1.0)))
+
+
 class DynamicSceneGraphModel(nn.Module):
     """Final integrated model: representation, temporal association, and graph heads."""
 
     def __init__(self, num_node_classes: int, num_edge_classes: int, dim: int = 384, num_parts: int = 8,
                  num_heads: int = 8, fusion_layers: int = 2, temporal_layers: int = 2, dropout: float = 0.1,
-                 graph_use_text: bool = False):
+                 graph_use_text: bool = False, use_rgb_token_mask: bool = False,
+                 extended_geometry: bool = False, graph_context: str = "transformer",
+                 graph_knn_neighbors: int = 0):
         super().__init__()
         self.object_encoder = SceneRepresentationModel(
             dim=dim,
@@ -292,6 +367,7 @@ class DynamicSceneGraphModel(nn.Module):
             num_layers=fusion_layers,
             dropout=dropout,
             graph_use_text=graph_use_text,
+            use_rgb_token_mask=use_rgb_token_mask,
         )
         self.association = SoftObjectAssociation(dim=dim)
         self.aggregation = TemporalAggregation()
@@ -306,16 +382,33 @@ class DynamicSceneGraphModel(nn.Module):
             batch_first=True,
         )
         
+        self.graph_context = graph_context
+        geom_dim = 16 if extended_geometry else 11
+        self.spatial_context = (
+            SpatialBidirectionalContext(dim=dim, geom_dim=geom_dim, neighbors=graph_knn_neighbors, dropout=dropout)
+            if graph_context == "spatial_gated" else None
+        )
         self.node_head = NodeClassifier(dim=dim, num_classes=num_node_classes)
-        self.edge_head = EdgeClassifier(dim=dim, num_relations=num_edge_classes)
+        self.edge_head = EdgeClassifier(
+            dim=dim,
+            num_relations=num_edge_classes,
+            geom_dim=geom_dim,
+        )
 
     def encode_objects(self, rgb_tokens: torch.Tensor, lidar_tokens: torch.Tensor, text_features: torch.Tensor):
         return self.object_encoder(rgb_tokens, lidar_tokens, text_features)
 
-    def _apply_context(self, node_features: torch.Tensor) -> torch.Tensor:
+    def _apply_context(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor | None = None,
+        geom_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if node_features.numel() == 0:
             return node_features
-        # Add batch dimension for TransformerEncoderLayer (B, S, E) where B=1
+        if self.graph_context == "spatial_gated":
+            return self.spatial_context(node_features, edge_index, geom_features) if self.spatial_context is not None and edge_index is not None else node_features
+        # Legacy baseline: global Transformer context over all objects in the scene.
         seq = node_features.unsqueeze(0)
         out = self.context_layer(seq)
         return out.squeeze(0)
@@ -331,7 +424,7 @@ class DynamicSceneGraphModel(nn.Module):
         geom_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict nodes and edges from one shared contextualized object set."""
-        context_features = self._apply_context(node_features)
+        context_features = self._apply_context(node_features, edge_index, geom_features)
         node_logits = self.node_head(context_features)
         if edge_index.numel() == 0:
             edge_logits = context_features.new_zeros((0, self.edge_head.num_relations))
@@ -356,7 +449,7 @@ class DynamicSceneGraphModel(nn.Module):
             geom_recon = node_features.new_zeros((0, self.edge_head.geom_dim))
             return (logits, geom_recon) if return_aux else logits
             
-        context_features = self._apply_context(node_features)
+        context_features = self._apply_context(node_features, edge_index, geom_features)
         logits, geom_recon = self.edge_head(
             context_features[edge_index[:, 0]],
             context_features[edge_index[:, 1]],

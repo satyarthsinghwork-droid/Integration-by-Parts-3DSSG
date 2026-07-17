@@ -349,6 +349,10 @@ def evaluate_model(args: argparse.Namespace) -> None:
         temporal_layers=config.temporal_layers,
         dropout=config.dropout,
         graph_use_text=config.graph_use_text,
+        use_rgb_token_mask=config.use_rgb_token_mask,
+        extended_geometry=config.extended_geometry,
+        graph_context=config.graph_context,
+        graph_knn_neighbors=config.graph_knn_neighbors,
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -407,7 +411,7 @@ def evaluate_model(args: argparse.Namespace) -> None:
         edge_index = edge_index.to(device)
         relation_targets = relation_targets.to(device)
         node_targets = node_labels_for_objects(objects, label_to_id, device)
-        geometry = edge_geometric_features(objects, edge_index, device)
+        geometry = edge_geometric_features(objects, edge_index, device, extended_geometry=config.extended_geometry)
 
         node_logits, edge_logits, _geometry_reconstruction = model.predict_graph(
             pooled_nodes,
