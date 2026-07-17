@@ -30,6 +30,20 @@ The included best checkpoint was selected at graph fine-tuning epoch 5 on all
 The complete Table 2, Table 3, and Table 10 values are stored in
 `results/evaluation_official_graph_best_official_proxy.json`.
 
+
+
+| Metric | OCRL | Ours | Difference |
+|---|---:|---:|---:|
+| Object R@1 | 60.10 | 56.16 | -3.94 |
+| Object R@5 | 80.14 | 76.44 | -3.70 |
+| Predicate R@1 | 92.41 | 81.59 | -10.82 |
+| Predicate R@3 | 97.05 | **97.20** | **+0.15** |
+| Triplet R@100 | 94.12 | 89.78 | -4.34 |
+| Object mR@1 | 22.82 | 18.89 | -3.93 |
+| Predicate mR@3 | 75.01 | **78.03** | **+3.02** |
+| SGCls constrained R@50 | 36.98 | 32.06 | -4.92 |
+| PredCls constrained R@50 | 86.15 | 75.06 | -11.09 |
+
 ## What Is Included
 
 - Static top-3 RGB object views from CLIP ViT-B/32 patch tokens.
