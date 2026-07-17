@@ -11,6 +11,7 @@ import torch
 from tqdm import tqdm
 
 from .lidar_utils import OfficialPointNetEncoder, farthest_point_sampling
+from .protocol_3dssg import load_official_objects
 
 
 def _stable_seed(scene_id: str, object_id: str) -> int:
@@ -18,7 +19,10 @@ def _stable_seed(scene_id: str, object_id: str) -> int:
     return int.from_bytes(digest[:8], "little") % (2**32)
 
 
-def _read_ascii_mesh(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _read_ascii_mesh(
+    ply_path: Path,
+    alignment: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read the 3RScan annotated mesh and calculate vertex normals from faces."""
     with open(ply_path, "r", encoding="utf-8") as handle:
         header: list[str] = []
@@ -39,6 +43,9 @@ def _read_ascii_mesh(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
         face_lines = [handle.readline() for _ in range(face_count)]
 
     xyz = vertices[:, :3]
+    if alignment is not None:
+        homogeneous = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=xyz.dtype)], axis=1)
+        xyz = np.asarray(homogeneous @ alignment, dtype=np.float32)[:, :3]
     rgb = vertices[:, 3:6] / 255.0
     instance_ids = vertices[:, 6].astype(np.int64)
     normals = np.zeros_like(xyz, dtype=np.float32)
@@ -61,16 +68,19 @@ def _read_ascii_mesh(ply_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return xyz, rgb.astype(np.float32), normals.astype(np.float32), instance_ids
 
 
-def _official_objects(official_subset_dir: Path) -> dict[str, dict[str, str]]:
-    """Return exactly the objects used by the OCRL train/validation annotations."""
-    targets: dict[str, dict[str, str]] = {}
-    for filename in ("relationships_train.json", "relationships_validation.json"):
-        data = json.loads((official_subset_dir / filename).read_text(encoding="utf-8"))
-        for scan in data.get("scans", []):
-            scan_targets = targets.setdefault(str(scan["scan"]), {})
-            for object_id, label in scan.get("objects", {}).items():
-                scan_targets[str(object_id)] = str(label)
-    return targets
+def _alignment_transforms(metadata_path: Path) -> dict[str, np.ndarray]:
+    """Load the rescan-to-reference transforms used by OCRL's transform_ply.py."""
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    transforms: dict[str, np.ndarray] = {}
+    for scene in metadata:
+        reference = str(scene["reference"])
+        transforms[reference] = np.eye(4, dtype=np.float32)
+        for scan in scene.get("scans", []):
+            scan_id = str(scan["reference"])
+            transform = scan.get("transform")
+            if transform is not None:
+                transforms[scan_id] = np.asarray(transform, dtype=np.float32).reshape(4, 4)
+    return transforms
 
 
 def _sample_object_points(points: np.ndarray, count: int, seed: int) -> np.ndarray:
@@ -103,6 +113,7 @@ def prepare_3rscan_lidar_tokens(
     checkpoint: Path,
     device: str | None,
     official_subset_dir: Path | None = None,
+    alignment_metadata: Path | None = None,
     points_per_object: int = 128,
     tokens_per_object: int = 64,
 ) -> None:
@@ -122,30 +133,40 @@ def prepare_3rscan_lidar_tokens(
     encoder = OfficialPointNetEncoder().to(device_obj).eval()
     encoder.load_state_dict(state, strict=True)
     checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    targets = _official_objects(official_subset_dir)
+    targets = load_official_objects(official_subset_dir)
+    transforms = _alignment_transforms(alignment_metadata) if alignment_metadata is not None else {}
     output_dir.mkdir(parents=True, exist_ok=True)
 
     processed = saved = skipped = 0
     for scan_id, scan_objects in tqdm(sorted(targets.items()), desc="Extracting official pretrained PointNet tokens"):
+        pending_objects = {
+            object_id: category_name
+            for object_id, category_name in scan_objects.items()
+            if not (output_dir / f"{scan_id}_{object_id}.pt").exists()
+        }
+        if not pending_objects:
+            continue
         ply_path = scan_dir / scan_id / "labels.instances.annotated.v2.ply"
         if not ply_path.exists():
-            skipped += len(scan_objects)
+            skipped += len(pending_objects)
             continue
         try:
-            xyz, rgb, normals, instance_ids = _read_ascii_mesh(ply_path)
+            if alignment_metadata is not None and scan_id not in transforms:
+                raise ValueError(f"No official 3RScan alignment transform found for {scan_id}")
+            xyz, rgb, normals, instance_ids = _read_ascii_mesh(ply_path, transforms.get(scan_id))
         except (OSError, ValueError) as error:
             print(f"Skipping {scan_id}: {error}")
-            skipped += len(scan_objects)
+            skipped += len(pending_objects)
             continue
 
-        for object_id, category_name in scan_objects.items():
+        for object_id, category_name in pending_objects.items():
             processed += 1
             save_path = output_dir / f"{scan_id}_{object_id}.pt"
-            if save_path.exists():
-                continue
             mask = instance_ids == int(object_id)
             object_xyz = xyz[mask]
-            if object_xyz.shape[0] < 10:
+            # OCRL samples with replacement, so even a one-point annotation is
+            # valid. Only truly empty annotations cannot be encoded.
+            if object_xyz.shape[0] == 0:
                 skipped += 1
                 continue
             object_points = np.concatenate([object_xyz, rgb[mask], normals[mask]], axis=1)
@@ -168,6 +189,8 @@ def prepare_3rscan_lidar_tokens(
                     "encoder_checkpoint": str(checkpoint),
                     "encoder_checkpoint_sha256": checkpoint_sha256,
                     "input_channels": "XYZ+RGB+normal",
+                    "coordinate_frame": "official reference-aligned" if alignment_metadata is not None else "scan-local",
+                    "alignment_metadata": str(alignment_metadata) if alignment_metadata is not None else None,
                     "points_per_object": points_per_object,
                     "tokens_per_object": tokens_per_object,
                 },
@@ -179,10 +202,11 @@ def prepare_3rscan_lidar_tokens(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare OCRL-pretrained PointNet object tokens for official 3DSSG.")
-    parser.add_argument("--scan-dir", type=Path, default=Path(r"D:\\MTP_Project\\3RScan"))
-    parser.add_argument("--official-subset-dir", type=Path, default=Path(r"D:\\MTP_Project\\MTP_Pipeline_3RScan\\official_splits"))
-    parser.add_argument("--output-dir", type=Path, default=Path(r"D:\\MTP_Project\\MTP_Pipeline_3RScan\\pipeline_data\\3rscan_pointnet_pretrained_tokens"))
-    parser.add_argument("--checkpoint", type=Path, default=Path(r"D:\\MTP_Project\\MTP_Pipeline_3RScan\\reference\\pretrained\\obj_enc.pth"))
+    parser.add_argument("--scan-dir", type=Path, required=True)
+    parser.add_argument("--official-subset-dir", type=Path, default=Path("official_splits"))
+    parser.add_argument("--alignment-metadata", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("pipeline_data/3rscan_pointnet_aligned_tokens_v6"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("reference/pretrained/obj_enc.pth"))
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -196,6 +220,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         device=args.device,
         official_subset_dir=args.official_subset_dir,
+        alignment_metadata=args.alignment_metadata,
     )
 
 

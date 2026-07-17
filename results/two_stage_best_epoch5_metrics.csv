@@ -1,0 +1,2 @@
+Method,Recall@1_obj,Recall@5_obj,Recall@1_pred,Recall@3_pred,Triplet_Recall@50,Triplet_Recall@100,mRecall@1_obj,mRecall@5_obj,mRecall@1_pred,mRecall@3_pred,mRecall@50_triplet,mRecall@100_triplet,SGCls_w@20,SGCls_w@50,SGCls_w@100,PredCls_w@20,PredCls_w@50,PredCls_w@100,SGCls_wo@20,SGCls_wo@50,SGCls_wo@100,PredCls_wo@20,PredCls_wo@50,PredCls_wo@100
+Proposed_two_stage_epoch5,56.16,76.44,81.59,97.20,87.21,89.78,18.89,40.20,52.60,78.03,58.39,69.10,29.87,32.06,32.34,64.32,75.06,75.91,29.72,34.63,37.83,62.61,81.04,90.22

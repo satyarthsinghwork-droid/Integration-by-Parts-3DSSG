@@ -132,6 +132,36 @@ def compute_predicate_weights(
     return weights / weights.mean()
 
 
+def compute_object_weights(
+    scene_database_dir: str | Path,
+    object_labels: list[str],
+    scene_tokens: list[str],
+    exponent: float = 0.25,
+) -> torch.Tensor:
+    """Return mild train-only class weights without letting rare classes dominate."""
+    scene_database_dir = Path(scene_database_dir)
+    frequency = {label: 0 for label in object_labels}
+    for token in scene_tokens:
+        scene_path = scene_database_dir / f"{token}.pt"
+        if not scene_path.exists():
+            continue
+        scene = torch.load(scene_path, map_location="cpu", weights_only=False)
+        seen_instances: set[str] = set()
+        for frame in scene.get("frames", []):
+            for obj in frame.get("objects", []):
+                instance = str(obj.get("instance_token"))
+                if instance in seen_instances:
+                    continue
+                seen_instances.add(instance)
+                label = str(obj.get("category_name", "unknown"))
+                if label in frequency:
+                    frequency[label] += 1
+    counts = torch.tensor([frequency[label] for label in object_labels], dtype=torch.float32)
+    weights = counts.clamp_min(1.0).pow(-float(exponent))
+    weights = weights / weights.mean()
+    return weights.clamp(0.5, 3.0)
+
+
 def stack_frame_tensors(
     frame: dict[str, Any],
     device: torch.device | str,

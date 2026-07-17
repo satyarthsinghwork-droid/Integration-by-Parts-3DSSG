@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from .config import ProjectPaths
+from .protocol_3dssg import write_official_objects_manifest
 
 
 def prepare_3rscan_text_embeddings(
@@ -66,7 +67,8 @@ def prepare_3rscan_text_embeddings(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare CLIP text embeddings for 3DSSG objects.")
-    parser.add_argument("--objects-json", type=Path, default=Path(r"D:\MTP_Project\3DSSG\objects.json"))
+    parser.add_argument("--objects-json", type=Path, default=None)
+    parser.add_argument("--official-subset-dir", type=Path, default=Path("official_splits"))
     parser.add_argument("--output-dir", type=Path, default=ProjectPaths().reference_root / "3rscan_text_embeddings")
     parser.add_argument("--model-name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--device", type=str, default=None)
@@ -75,7 +77,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    prepare_3rscan_text_embeddings(args.objects_json, args.output_dir, args.model_name, args.device)
+    objects_json = args.objects_json
+    if objects_json is None:
+        objects_json = write_official_objects_manifest(
+            args.official_subset_dir,
+            args.output_dir.parent / "official_objects_manifest.json",
+        )
+    prepare_3rscan_text_embeddings(objects_json, args.output_dir, args.model_name, args.device)
 
 
 if __name__ == "__main__":

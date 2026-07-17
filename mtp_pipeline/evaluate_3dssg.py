@@ -35,6 +35,21 @@ def _class_mean_recall(ranks_by_class: dict[int, list[int]], k: int) -> float:
     return _average(recalls)
 
 
+def _official_triplet_mean_recall(ranks_by_class: dict[int, list[int]], k: int) -> float:
+    """Reproduce OCRL's released Table-2 triplet mR implementation.
+
+    The reference helper iterates ``range(cls_matrix.max())`` and consequently
+    omits the numerically largest observed predicate ID. Keeping this behavior
+    is necessary when comparing against numbers produced by the released code.
+    """
+    observed = [label for label, ranks in ranks_by_class.items() if ranks]
+    if not observed:
+        return 0.0
+    maximum = max(observed)
+    recalls = [_recall_from_ranks(ranks_by_class[label], k) for label in range(maximum) if ranks_by_class.get(label)]
+    return _average(recalls)
+
+
 def _percent_tree(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _percent_tree(item) for key, item in value.items()}
@@ -223,19 +238,22 @@ def _triplet_ranks_for_scene(
         }
         gt_relations = torch.nonzero(relation_targets[edge_id] > 0.5, as_tuple=False).flatten().tolist()
         if not gt_relations:
-            none_rank = next((rank for rank, item in enumerate(candidates, start=1) if item[3] < 0.5), 101)
+            none_rank = next((rank for rank, item in enumerate(candidates, start=1) if item[3] < 0.5), 102)
             ranks.append(none_rank)
             continue
 
         source_gt = int(node_targets[source_index])
         target_gt = int(node_targets[target_index])
         relation_ranks = [
-            candidate_rank.get((source_gt, target_gt, relation_label), 101)
+            candidate_rank.get((source_gt, target_gt, relation_label), 102)
             for relation_label in gt_relations
         ]
-        for relation_label, rank in zip(gt_relations, relation_ranks):
+        adjusted_ranks = [rank - counter for counter, rank in enumerate(sorted(relation_ranks))]
+        # This pairing intentionally follows the released OCRL code: adjusted
+        # sorted ranks are zipped with predicates in annotation order.
+        for relation_label, rank in zip(gt_relations, adjusted_ranks):
             ranks_by_relation[relation_label].append(rank)
-        ranks.extend(sorted(relation_ranks))
+        ranks.extend(adjusted_ranks)
 
     return ranks, ranks_by_relation
 
@@ -256,10 +274,12 @@ def _predicate_ranks_for_scene(
 
         relation_ranks = []
         for relation_label in gt_relations:
-            rank = int((scores > scores[relation_label]).sum().item()) + 1
+            rank = min(int((scores > scores[relation_label]).sum().item()) + 1, 7)
             relation_ranks.append(rank)
+        adjusted_ranks = [rank - counter for counter, rank in enumerate(sorted(relation_ranks))]
+        for relation_label, rank in zip(gt_relations, adjusted_ranks):
             ranks_by_relation[relation_label].append(rank)
-        ranks.extend(sorted(relation_ranks))
+        ranks.extend(adjusted_ranks)
     return ranks, ranks_by_relation
 
 
@@ -270,7 +290,7 @@ def _object_ranks_for_scene(
     ranks = []
     ranks_by_class: dict[int, list[int]] = defaultdict(list)
     for index, target in enumerate(node_targets.tolist()):
-        rank = int((node_probs[index] > node_probs[index, target]).sum().item()) + 1
+        rank = min(int((node_probs[index] > node_probs[index, target]).sum().item()) + 1, 12)
         ranks.append(rank)
         ranks_by_class[target].append(rank)
     return ranks, ranks_by_class
@@ -349,6 +369,13 @@ def evaluate_model(args: argparse.Namespace) -> None:
         temporal_layers=config.temporal_layers,
         dropout=config.dropout,
         graph_use_text=config.graph_use_text,
+        graph_input_mode=config.graph_input_mode,
+        use_rgb_token_mask=config.use_rgb_token_mask,
+        extended_geometry=config.extended_geometry,
+        graph_context=config.graph_context,
+        graph_knn_neighbors=config.graph_knn_neighbors,
+        conditioned_part_queries=config.conditioned_part_queries,
+        hybrid_spatial_init=config.hybrid_spatial_init,
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -407,7 +434,7 @@ def evaluate_model(args: argparse.Namespace) -> None:
         edge_index = edge_index.to(device)
         relation_targets = relation_targets.to(device)
         node_targets = node_labels_for_objects(objects, label_to_id, device)
-        geometry = edge_geometric_features(objects, edge_index, device)
+        geometry = edge_geometric_features(objects, edge_index, device, extended_geometry=config.extended_geometry)
 
         node_logits, edge_logits, _geometry_reconstruction = model.predict_graph(
             pooled_nodes,
@@ -479,8 +506,8 @@ def evaluate_model(args: argparse.Namespace) -> None:
         "Triplet": {
             "R@50": _recall_from_ranks(triplet_ranks, 50),
             "R@100": _recall_from_ranks(triplet_ranks, 100),
-            "mR@50": _class_mean_recall(triplet_ranks_by_class, 50),
-            "mR@100": _class_mean_recall(triplet_ranks_by_class, 100),
+            "mR@50": _official_triplet_mean_recall(triplet_ranks_by_class, 50),
+            "mR@100": _official_triplet_mean_recall(triplet_ranks_by_class, 100),
         },
     }
     table_3 = {
@@ -518,7 +545,10 @@ def evaluate_model(args: argparse.Namespace) -> None:
 
     print("\n--- Official OCRL/3DSSG Protocol Results (percent) ---")
     print(json.dumps(_percent_tree(summary), indent=4))
-    output_path = args.checkpoint.parent / f"evaluation_official_{args.checkpoint.stem}.json"
+    output_path = getattr(args, "result_output", None)
+    if output_path is None:
+        output_path = args.checkpoint.parent / f"evaluation_official_{args.checkpoint.stem}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Saved evaluation results to {output_path}")
 
@@ -530,11 +560,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=ProjectPaths().output_root)
     parser.add_argument("--database", type=Path, default=None)
     parser.add_argument("--mode", choices=["static", "temporal"], default="static")
-    parser.add_argument("--train-scans", type=Path, default=Path(r"D:\MTP_Project\MTP_Pipeline_3RScan\official_splits\train_scans.txt"))
-    parser.add_argument("--val-scans", type=Path, default=Path(r"D:\MTP_Project\MTP_Pipeline_3RScan\official_splits\validation_scans.txt"))
+    parser.add_argument("--train-scans", type=Path, default=Path("official_splits/train_scans.txt"))
+    parser.add_argument("--val-scans", type=Path, default=Path("official_splits/validation_scans.txt"))
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-scenes", type=int, default=None, help="Optional small evaluation slice for a smoke test.")
+    parser.add_argument("--result-output", type=Path, default=None)
     return parser.parse_args()
 
 

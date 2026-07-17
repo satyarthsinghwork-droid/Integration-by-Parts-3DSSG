@@ -6,6 +6,8 @@ pipeline_data/
 # Model Outputs and Checkpoints
 pipeline_outputs/
 pipeline_outputs_smoke/
+smoke_work/
+.venv/
 
 # Environment and Jupyter
 anaconda_projects/
@@ -17,6 +19,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.tmp
 
 # Temporary/Compiled files
 *.pdf

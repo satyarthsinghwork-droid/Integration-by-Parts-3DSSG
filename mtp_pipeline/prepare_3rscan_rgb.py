@@ -8,12 +8,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pandas as pd
 import torch
 from PIL import Image
 from tqdm import tqdm
 
 from .config import ProjectPaths
+from .protocol_3dssg import write_official_objects_manifest
 
 
 def load_intrinsics(info_path: str) -> np.ndarray:
@@ -223,9 +223,10 @@ def prepare_3rscan_rgb_tokens(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract continuous RGB temporal frames for 3RScan.")
-    parser.add_argument("--scan-dir", type=Path, default=Path(r"D:\MTP_Project\3RScan"))
-    parser.add_argument("--objects-json", type=Path, default=Path(r"D:\MTP_Project\3DSSG\objects.json"))
+    parser = argparse.ArgumentParser(description="Extract sampled RGB object views for static 3DSSG.")
+    parser.add_argument("--scan-dir", type=Path, required=True)
+    parser.add_argument("--objects-json", type=Path, default=None)
+    parser.add_argument("--official-subset-dir", type=Path, default=Path("official_splits"))
     parser.add_argument("--output-dir", type=Path, default=ProjectPaths().reference_root / "3rscan_rgb_temporal")
     parser.add_argument("--model-name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--device", type=str, default=None)
@@ -234,7 +235,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    prepare_3rscan_rgb_tokens(args.scan_dir, args.objects_json, args.output_dir, args.model_name, args.device)
+    objects_json = args.objects_json
+    if objects_json is None:
+        objects_json = write_official_objects_manifest(
+            args.official_subset_dir,
+            args.output_dir.parent / "official_objects_manifest.json",
+        )
+    prepare_3rscan_rgb_tokens(args.scan_dir, objects_json, args.output_dir, args.model_name, args.device)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,8 @@ def graph_losses_for_3dssg_scene(
     device: torch.device,
     relation_labels: list[str],
     max_negative_ratio: int | None = None,
+    extended_geometry: bool = False,
+    compute_dynamic: bool = True,
 ) -> dict[str, torch.Tensor]:
     
     zero = results["temporal_loss"].new_zeros(())
@@ -80,7 +82,7 @@ def graph_losses_for_3dssg_scene(
     edge_index = edge_index.to(device)
     edge_labels = edge_labels.to(device)
     node_labels = node_labels_for_objects(unique_objects, label_to_id, device)
-    edge_geom = edge_geometric_features(unique_objects, edge_index, device)
+    edge_geom = edge_geometric_features(unique_objects, edge_index, device, extended_geometry=extended_geometry)
 
     node_logits, edge_logits, geom_reconstruction = model.predict_graph(
         pooled_node_features,
@@ -96,6 +98,14 @@ def graph_losses_for_3dssg_scene(
         geom_reconstruction=geom_reconstruction,
         geom_targets=edge_geom,
     )
+
+    if not compute_dynamic:
+        return {
+            "node_loss": losses["node_loss"],
+            "edge_loss": losses["edge_loss"],
+            "lse_loss": losses["lse_loss"],
+            "dynamic_loss": zero,
+        }
 
     edge_probs_by_frame = []
     for t, frame_encoded in enumerate(results["encoded_scene"]):
@@ -117,7 +127,7 @@ def graph_losses_for_3dssg_scene(
             continue
             
         frame_edge_idx = torch.tensor(frame_edge_list, dtype=torch.long, device=device)
-        frame_geom = edge_geometric_features(frame_objects, frame_edge_idx, device)
+        frame_geom = edge_geometric_features(frame_objects, frame_edge_idx, device, extended_geometry=extended_geometry)
         frame_edge_logits = model.predict_edges(frame_nodes, frame_edge_idx, frame_geom)
         
         if frame_edge_logits.numel():
@@ -164,6 +174,11 @@ def train(args: argparse.Namespace) -> Path:
         lambda_temporal_part = 0.0
 
     config = PipelineConfig(
+        dim=getattr(args, "embedding_dim", 384),
+        use_rgb_token_mask=getattr(args, "use_rgb_token_mask", False),
+        extended_geometry=getattr(args, "extended_geometry", False),
+        graph_context=getattr(args, "graph_context", "transformer"),
+        graph_knn_neighbors=getattr(args, "graph_knn_neighbors", 0),
         learning_rate=args.learning_rate,
         lambda_temporal=lambda_temporal,
         lambda_temporal_part=lambda_temporal_part,
@@ -220,6 +235,11 @@ def train(args: argparse.Namespace) -> Path:
         temporal_layers=config.temporal_layers,
         dropout=config.dropout,
         graph_use_text=config.graph_use_text,
+        graph_input_mode=config.graph_input_mode,
+        use_rgb_token_mask=config.use_rgb_token_mask,
+        extended_geometry=config.extended_geometry,
+        graph_context=config.graph_context,
+        graph_knn_neighbors=config.graph_knn_neighbors,
     ).to(device)
 
     representation_loss = RepresentationLoss(
@@ -232,12 +252,13 @@ def train(args: argparse.Namespace) -> Path:
     
     print("Computing Alpha class weights to balance rare 3DSSG relationships...")
     alpha_weights = compute_predicate_weights(database_dir, relation_labels, scene_tokens=dataset.scene_tokens).to(device)
-    graph_loss = GraphPredictionLoss(alpha=alpha_weights).to(device)
+    graph_loss = GraphPredictionLoss(alpha=alpha_weights, negative_weight=getattr(args, "edge_negative_weight", 1.0)).to(device)
     
     dynamic_loss = DynamicEdgeConsistencyLoss().to(device)
 
     history = []
     resume_optimizer_state = None
+    resume_scheduler_state = None
     start_epoch = 0
     if getattr(args, "resume_checkpoint", None) is not None:
         print(f"Warm-starting from checkpoint: {args.resume_checkpoint}")
@@ -245,6 +266,7 @@ def train(args: argparse.Namespace) -> Path:
         missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
         history = checkpoint.get("history", [])
         resume_optimizer_state = checkpoint.get("optimizer")
+        resume_scheduler_state = checkpoint.get("scheduler")
         start_epoch = int(history[-1].get("epoch", len(history))) if history else 0
         if start_epoch >= args.epochs:
             print(f"Checkpoint already contains {start_epoch} epochs; target is {args.epochs}. Nothing to resume.")
@@ -260,8 +282,23 @@ def train(args: argparse.Namespace) -> Path:
         optimizer.load_state_dict(resume_optimizer_state)
         print("Restored optimizer state from checkpoint.")
 
+    scheduler = None
+    if getattr(args, "lr_schedule", "none") == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        if resume_scheduler_state is not None:
+            scheduler.load_state_dict(resume_scheduler_state)
+
+    def edge_lambda_for_epoch(epoch_index: int) -> float:
+        warmup_epochs = max(int(getattr(args, "edge_warmup_epochs", 0)), 0)
+        start = float(getattr(args, "edge_warmup_start", 1.0))
+        if warmup_epochs <= 1 or epoch_index >= warmup_epochs - 1:
+            return config.lambda_edge
+        fraction = epoch_index / float(warmup_epochs - 1)
+        return config.lambda_edge * (start + (1.0 - start) * fraction)
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        current_lambda_edge = edge_lambda_for_epoch(epoch)
         totals = {
             "total": 0.0,
             "representation": 0.0,
@@ -309,6 +346,7 @@ def train(args: argparse.Namespace) -> Path:
                 device=device,
                 relation_labels=relation_labels,
                 max_negative_ratio=args.negative_ratio,
+                extended_geometry=config.extended_geometry,
             )
             
             total_loss = (
@@ -316,7 +354,7 @@ def train(args: argparse.Namespace) -> Path:
                 + config.lambda_temporal * results["temporal_loss"]
                 + config.lambda_temporal_part * temp_part
                 + config.lambda_node * g["node_loss"]
-                + config.lambda_edge * (g["edge_loss"] + 0.1 * g["lse_loss"])
+                + current_lambda_edge * (g["edge_loss"] + 0.1 * g["lse_loss"])
                 + config.lambda_dynamic * g["dynamic_loss"]
             )
             total_loss.backward()
@@ -337,13 +375,18 @@ def train(args: argparse.Namespace) -> Path:
 
         epoch_metrics = {key: value / max(used, 1) for key, value in totals.items()}
         epoch_metrics["epoch"] = epoch + 1
+        epoch_metrics["lambda_edge"] = current_lambda_edge
+        epoch_metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
         history.append(epoch_metrics)
+        if scheduler is not None:
+            scheduler.step()
 
         checkpoint_path = paths.checkpoints / f"integration_by_parts_3rscan_epoch_{epoch + 1}.pt"
         torch.save(
             {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "config": config.__dict__,
                 "label_to_id": label_to_id,
                 "id_to_label": id_to_label,
@@ -352,6 +395,11 @@ def train(args: argparse.Namespace) -> Path:
                 "seed": getattr(args, "seed", 42),
                 "mode": args.mode,
                 "database": str(database_dir),
+                "negative_ratio": args.negative_ratio,
+                "edge_negative_weight": getattr(args, "edge_negative_weight", 1.0),
+                "lr_schedule": getattr(args, "lr_schedule", "none"),
+                "edge_warmup_epochs": getattr(args, "edge_warmup_epochs", 0),
+                "edge_warmup_start": getattr(args, "edge_warmup_start", 1.0),
             },
             checkpoint_path,
         )
@@ -377,8 +425,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scenes", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--embedding-dim", type=int, default=384)
+    parser.add_argument("--use-rgb-token-mask", action="store_true")
+    parser.add_argument("--extended-geometry", action="store_true")
+    parser.add_argument("--graph-context", choices=["transformer", "spatial_gated"], default="transformer")
+    parser.add_argument("--graph-knn-neighbors", type=int, default=0)
+    parser.add_argument("--lr-schedule", choices=["none", "cosine"], default="none")
+    parser.add_argument("--edge-warmup-epochs", type=int, default=0)
+    parser.add_argument("--edge-warmup-start", type=float, default=1.0)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--negative-ratio", type=int, default=None, help="Optional negative-pair cap; omit for the official all-pairs protocol.")
+    parser.add_argument("--edge-negative-weight", type=float, default=1.0, help="Relative contribution of absent-predicate labels in the balanced edge loss.")
     parser.add_argument("--lambda-temporal", type=float, default=1.0)
     parser.add_argument("--lambda-temporal-part", type=float, default=0.5)
     parser.add_argument("--lambda-node", type=float, default=1.0)

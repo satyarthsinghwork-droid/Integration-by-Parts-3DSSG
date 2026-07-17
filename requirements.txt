@@ -1,0 +1,8 @@
+numpy==2.4.6
+opencv-python-headless==4.11.0.86
+Pillow==11.3.0
+torch==2.6.0
+tqdm==4.67.3
+transformers==5.12.1
+jupyterlab==4.6.0
+ipykernel==7.3.0

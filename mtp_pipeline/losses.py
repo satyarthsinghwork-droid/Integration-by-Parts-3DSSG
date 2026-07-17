@@ -101,9 +101,17 @@ class ObjectContrastiveLoss(nn.Module):
 class RepresentationLoss(nn.Module):
     """Slides 36-39: part diversity, cross-modal part alignment, object alignment."""
 
-    def __init__(self, lambda_part: float = 1.0, lambda_object: float = 1.0, temperature: float = 0.07):
+    def __init__(
+        self,
+        lambda_part: float = 1.0,
+        lambda_object: float = 1.0,
+        temperature: float = 0.07,
+        lambda_diversity: float | None = None,
+        lambda_part_alignment: float | None = None,
+    ):
         super().__init__()
-        self.lambda_part = lambda_part
+        self.lambda_diversity = lambda_part if lambda_diversity is None else lambda_diversity
+        self.lambda_part_alignment = lambda_part if lambda_part_alignment is None else lambda_part_alignment
         self.lambda_object = lambda_object
         self.diversity = ComponentDiversityLoss()
         self.part_alignment = PartAlignmentLoss(temperature=temperature)
@@ -123,7 +131,11 @@ class RepresentationLoss(nn.Module):
             rgb_mask=rgb_mask,
         )
         part_loss = diversity + part_align
-        total = self.lambda_part * part_loss + self.lambda_object * object_loss
+        total = (
+            self.lambda_diversity * diversity
+            + self.lambda_part_alignment * part_align
+            + self.lambda_object * object_loss
+        )
         return {
             "representation_loss": total,
             "part_loss": part_loss,
@@ -216,11 +228,30 @@ class TemporalPartAlignmentLoss(nn.Module):
 class GraphPredictionLoss(nn.Module):
     """Node cross-entropy plus a multi-label focal loss for 26 relation outputs."""
 
-    def __init__(self, focal_gamma: float = 2.0, alpha: torch.Tensor | None = None, lambda_lse: float = 0.1):
+    def __init__(
+        self,
+        focal_gamma: float = 2.0,
+        alpha: torch.Tensor | None = None,
+        lambda_lse: float = 0.1,
+        negative_weight: float = 1.0,
+        edge_loss_mode: str = "balanced",
+        edge_balance_mix: float = 0.15,
+        node_weights: torch.Tensor | None = None,
+        node_balance_mix: float = 0.0,
+        node_label_smoothing: float = 0.0,
+    ):
         super().__init__()
+        if edge_loss_mode not in {"legacy", "balanced", "hybrid"}:
+            raise ValueError(f"Unknown edge loss mode: {edge_loss_mode}")
         self.focal_gamma = focal_gamma
         self.lambda_lse = lambda_lse
+        self.negative_weight = negative_weight
+        self.edge_loss_mode = edge_loss_mode
+        self.edge_balance_mix = float(edge_balance_mix)
+        self.node_balance_mix = float(node_balance_mix)
+        self.node_label_smoothing = float(node_label_smoothing)
         self.register_buffer("alpha", alpha)
+        self.register_buffer("node_weights", node_weights)
 
     def edge_focal_loss(self, edge_logits: torch.Tensor, edge_targets: torch.Tensor) -> torch.Tensor:
         if edge_logits.shape != edge_targets.shape:
@@ -233,11 +264,27 @@ class GraphPredictionLoss(nn.Module):
         pt = probabilities * targets + (1.0 - probabilities) * (1.0 - targets)
         loss = (1.0 - pt).pow(self.focal_gamma) * bce
 
-        if self.alpha is not None:
+        positive_mask = targets > 0.5
+        negative_mask = ~positive_mask
+        if self.alpha is None:
+            positive_weights = torch.ones((1, targets.size(1)), dtype=targets.dtype, device=targets.device)
+        else:
             positive_weights = self.alpha.to(device=edge_logits.device, dtype=edge_logits.dtype).view(1, -1)
-            weights = targets * positive_weights + (1.0 - targets)
-            loss = loss * weights
-        return loss.mean()
+
+        legacy_weights = targets * positive_weights + (1.0 - targets)
+        legacy_loss = (loss * legacy_weights).mean()
+
+        weighted_positive = loss * positive_mask * positive_weights
+        positive_norm = (positive_mask * positive_weights).sum().clamp_min(1.0)
+        positive_loss = weighted_positive.sum() / positive_norm
+        negative_loss = loss[negative_mask].mean() if negative_mask.any() else loss.new_zeros(())
+        balanced_loss = positive_loss + self.negative_weight * negative_loss
+        if self.edge_loss_mode == "legacy":
+            return legacy_loss
+        if self.edge_loss_mode == "balanced":
+            return balanced_loss
+        mix = min(max(self.edge_balance_mix, 0.0), 1.0)
+        return (1.0 - mix) * legacy_loss + mix * balanced_loss
 
     def forward(
         self,
@@ -248,7 +295,25 @@ class GraphPredictionLoss(nn.Module):
         geom_reconstruction: torch.Tensor | None = None,
         geom_targets: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        node_loss = F.cross_entropy(node_logits, node_labels) if node_logits.numel() else node_logits.sum()
+        if node_logits.numel():
+            plain_node_loss = F.cross_entropy(
+                node_logits,
+                node_labels,
+                label_smoothing=self.node_label_smoothing,
+            )
+            if self.node_weights is not None and self.node_balance_mix > 0:
+                balanced_node_loss = F.cross_entropy(
+                    node_logits,
+                    node_labels,
+                    weight=self.node_weights.to(node_logits),
+                    label_smoothing=self.node_label_smoothing,
+                )
+                mix = min(max(self.node_balance_mix, 0.0), 1.0)
+                node_loss = (1.0 - mix) * plain_node_loss + mix * balanced_node_loss
+            else:
+                node_loss = plain_node_loss
+        else:
+            node_loss = node_logits.sum()
         if edge_logits is None or edge_labels is None or edge_logits.numel() == 0:
             edge_loss = node_loss.new_zeros(())
         else:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+from .protocol_3dssg import OCRL_INVALID_ALIGNED_SCAN_IDS
+
 
 def read_scan_list(path: str | Path | None) -> list[str]:
     """Read one reference scan ID per line."""
@@ -27,6 +29,7 @@ def get_3rscan_splits(
     train_scans: str | Path | None = None,
     val_scans: str | Path | None = None,
     seed: int = 42,
+    exclude_ocr_invalid_scan: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Return the official split, including every scan_split annotation entry.
 
@@ -37,7 +40,12 @@ def get_3rscan_splits(
     official_train = set(read_scan_list(train_scans))
     official_val = set(read_scan_list(val_scans))
     if official_train and official_val:
-        train_tokens = [token for token in scene_tokens if _reference_scan_id(token) in official_train]
+        excluded = OCRL_INVALID_ALIGNED_SCAN_IDS if exclude_ocr_invalid_scan else frozenset()
+        train_tokens = [
+            token
+            for token in scene_tokens
+            if _reference_scan_id(token) in official_train and _reference_scan_id(token) not in excluded
+        ]
         val_tokens = [token for token in scene_tokens if _reference_scan_id(token) in official_val]
         if train_tokens or val_tokens:
             return train_tokens, val_tokens

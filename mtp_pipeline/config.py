@@ -8,8 +8,8 @@ from pathlib import Path
 class ProjectPaths:
     """Filesystem layout used by the clean pipeline."""
 
-    reference_root: Path = Path(r"D:\MTP_Project\MTP_Pipeline_3RScan\pipeline_data")
-    output_root: Path = Path(r"D:\MTP_Project\MTP_Pipeline_3RScan\pipeline_outputs")
+    reference_root: Path = Path("pipeline_data")
+    output_root: Path = Path("pipeline_outputs")
 
     @property
     def nuscenes_root(self) -> Path:
@@ -48,12 +48,28 @@ class PipelineConfig:
     num_parts: int = 7
     # Category-name prompts remain representation supervision only in SGCls.
     graph_use_text: bool = False
+    # ``lidar_only`` matches OCRL graph-stage inputs while retaining RGB/text
+    # as cross-modal supervision for object pretraining.
+    graph_input_mode: str = "multimodal"
+    # Versioned v3 experiment: respect padded multi-view RGB tokens.
+    use_rgb_token_mask: bool = False
+    # Versioned v3 experiment: extend relation geometry from 11 to 16 dimensions.
+    extended_geometry: bool = False
+    # Optional v4 graph-only ablation; legacy Transformer context remains the default.
+    graph_context: str = "transformer"
+    graph_knn_neighbors: int = 0
+    # Final two-stage experiment: condition shared part identities on each object's LiDAR context.
+    conditioned_part_queries: bool = False
+    # Initial contribution of the spatial residual in hybrid graph context.
+    hybrid_spatial_init: float = 0.15
     num_heads: int = 8
     fusion_layers: int = 4
     temporal_layers: int = 4
     dropout: float = 0.1
     temperature: float = 0.07
     lambda_part: float = 1.0
+    lambda_diversity: float | None = None
+    lambda_part_alignment: float | None = None
     lambda_object: float = 1.0
     lambda_temporal: float = 1.0
     lambda_temporal_part: float = 0.5

@@ -16,7 +16,24 @@ def encode_frame(frame: dict[str, Any], scene_model: torch.nn.Module, device: to
         dtype=torch.bool,
         device=rgb_tokens.device,
     )
-    outputs = scene_model(rgb_tokens, lidar_tokens, text_features, has_rgb_mask=has_rgb)
+    rgb_token_mask = torch.stack(
+        [
+            obj.get(
+                "rgb_token_mask",
+                torch.ones(obj["patch_tokens"].size(0), dtype=torch.bool)
+                if obj.get("has_rgb", True)
+                else torch.zeros(obj["patch_tokens"].size(0), dtype=torch.bool),
+            ).to(dtype=torch.bool)
+            for obj in frame["objects"]
+        ]
+    ).to(device=rgb_tokens.device)
+    outputs = scene_model(
+        rgb_tokens,
+        lidar_tokens,
+        text_features,
+        has_rgb_mask=has_rgb,
+        rgb_token_mask=rgb_token_mask,
+    )
     outputs["has_rgb_mask"] = has_rgb
     return {
         "sample_token": frame["sample_token"],
