@@ -1,7 +1,6 @@
 # Integration by Parts: Geometry-Aware Compositional Multimodal Learning for 3D Semantic Scene Graphs
 
-![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)
+
 
 This repository contains the official implementation of **Integration by Parts: Geometry-Aware Compositional Multimodal Learning for 3D Semantic Scene Graphs**. 
 
@@ -37,5 +36,3 @@ Our method establishes a new state-of-the-art on the 3DSSG (3RScan) benchmark, d
 2. Run the `build_3rscan_database.py` script to fuse the multi-modal embeddings and extract 3D centroids.
 3. Open `run_3rscan_pipeline.ipynb` to train the model and evaluate the metrics.
 
-## License
-This project is submitted anonymously for review.
